@@ -2,11 +2,13 @@ import { Router } from "express"
 import { ObjectId } from "mongodb"
 
 import { collections } from "../lib/db.js"
+import { parsePagination } from "../lib/pagination.js"
 import {
   BOOKING_STATUSES,
   BOOKING_TRANSITIONS,
   EQUIPMENT_STATUSES,
   isSupportedRentalType,
+  PAYMENT_STATUSES,
   normalizeBooking,
   normalizeEquipment,
   normalizePayment,
@@ -719,36 +721,66 @@ router.get("/rentals", async (req, res, next) => {
     const bookingStatus = String(req.query.bookingStatus ?? "").toLowerCase()
     const paymentStatus = String(req.query.paymentStatus ?? "").toLowerCase()
     const search = String(req.query.q ?? "").trim()
+    const pagination = parsePagination(req.query)
+    if (pagination.error) return fail(res, 400, pagination.error)
 
-    const docs = await collections.bookings
-      .find(ownerBookingsFilter(req.user.id))
-      .sort({ createdAt: -1 })
-      .toArray()
+    if (
+      bookingStatus &&
+      bookingStatus !== "all" &&
+      !BOOKING_STATUSES.includes(bookingStatus)
+    ) {
+      return fail(res, 400, "Unknown booking status filter.")
+    }
+    if (
+      paymentStatus &&
+      paymentStatus !== "all" &&
+      !PAYMENT_STATUSES.includes(paymentStatus)
+    ) {
+      return fail(res, 400, "Unknown payment status filter.")
+    }
 
-    const filtered = docs.filter((doc) => {
-      const matchesBooking =
-        !bookingStatus ||
-        bookingStatus === "all" ||
-        String(doc.bookingStatus ?? doc.status ?? "pending").toLowerCase() ===
-          bookingStatus
-      const matchesPayment =
-        !paymentStatus ||
-        paymentStatus === "all" ||
-        String(doc.paymentStatus ?? "unpaid").toLowerCase() === paymentStatus
+    const filter = ownerBookingsFilter(req.user.id)
+    const clauses = []
+    if (bookingStatus && bookingStatus !== "all") {
+      const byStatus = [
+        { bookingStatus },
+        { bookingStatus: null, status: bookingStatus },
+      ]
+      if (bookingStatus === "pending") {
+        byStatus.push({
+          bookingStatus: { $exists: false },
+          status: { $exists: false },
+        }, {
+          bookingStatus: null,
+          status: { $exists: false },
+        })
+      }
+      clauses.push({ $or: byStatus })
+    }
+    if (paymentStatus && paymentStatus !== "all") {
+      clauses.push(
+        paymentStatus === "unpaid"
+          ? { $or: [{ paymentStatus: "unpaid" }, { paymentStatus: null }] }
+          : { paymentStatus }
+      )
+    }
+    if (search) {
+      const pattern = new RegExp(
+        search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i"
+      )
+      clauses.push({ $or: [{ equipmentName: pattern }, { customerName: pattern }] })
+    }
+    if (clauses.length > 0) filter.$and = clauses
 
-      const matchesQuery =
-        !search ||
-        String(doc.equipmentName ?? "").toLowerCase().includes(
-          search.toLowerCase()
-        ) ||
-        String(doc.customerName ?? "").toLowerCase().includes(
-          search.toLowerCase()
-        )
+    const cursor = collections.bookings
+      .find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+    if (pagination.requested) {
+      cursor.skip(pagination.skip).limit(pagination.limit)
+    }
 
-      return matchesBooking && matchesPayment && matchesQuery
-    })
-
-    const rentals = await serializeOwnerBookings(filtered)
+    const rentals = await serializeOwnerBookings(await cursor.toArray())
 
     return ok(res, rentals)
   } catch (error) {

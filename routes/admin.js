@@ -2,6 +2,7 @@ import { Router } from "express"
 import { ObjectId } from "mongodb"
 
 import { collections } from "../lib/db.js"
+import { parsePagination } from "../lib/pagination.js"
 import {
   bookingLifecycleFilter,
   acquireEquipmentReservationLock,
@@ -601,6 +602,8 @@ router.get("/rentals", async (req, res, next) => {
     const filter = {}
     const bookingStatus = String(req.query.bookingStatus ?? "").toLowerCase()
     const paymentStatus = String(req.query.paymentStatus ?? "").toLowerCase()
+    const pagination = parsePagination(req.query)
+    if (pagination.error) return fail(res, 400, pagination.error)
 
     if (bookingStatus && bookingStatus !== "all") {
       if (!BOOKING_STATUSES.includes(bookingStatus)) {
@@ -610,13 +613,19 @@ router.get("/rentals", async (req, res, next) => {
     }
 
     if (paymentStatus && paymentStatus !== "all") {
+      if (!PAYMENT_STATUSES.includes(paymentStatus)) {
+        return fail(res, 400, "Unknown payment status filter.")
+      }
       filter.paymentStatus = paymentStatus
     }
 
-    const docs = await collections.bookings
+    const cursor = collections.bookings
       .find(filter)
-      .sort({ createdAt: -1 })
-      .toArray()
+      .sort({ createdAt: -1, _id: -1 })
+    if (pagination.requested) {
+      cursor.skip(pagination.skip).limit(pagination.limit)
+    }
+    const docs = await cursor.toArray()
 
     const users = await loadUsers([
       ...docs.map((doc) => toId(doc.customerId ?? doc.customer?._id ?? doc.userId)),

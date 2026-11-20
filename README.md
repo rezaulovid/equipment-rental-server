@@ -53,6 +53,9 @@ startup.
 - `/api/owner` — owner equipment, rentals, and analytics
 - `/api/admin` — admin management and platform analytics
 
+Customer, owner, and admin rental lists accept optional `page` and `limit`
+query parameters while retaining their existing array response shape.
+
 Authentication tokens are verified against the BetterAuth JWKS endpoint at
 `{BETTER_AUTH_URL}/api/auth/jwks`. API roles are loaded from MongoDB for each
 request.
