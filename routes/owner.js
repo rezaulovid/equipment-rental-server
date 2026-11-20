@@ -16,12 +16,15 @@ import {
   toNumber,
 } from "../lib/normalize.js"
 import {
+  acquireEquipmentReservationLock,
   bookingLifecycleFilter,
   equipmentByIdFilter,
   idCandidates,
   inventoryHoldFilter,
   loadBookingsMap,
   loadEquipmentMap,
+  maximumReservedQuantity,
+  releaseEquipmentReservationLock,
 } from "../lib/records.js"
 import { verifyOwner, verifyToken } from "../middleware/auth.js"
 
@@ -603,16 +606,51 @@ router.patch("/equipment/:id", async (req, res, next) => {
 
     patch.updatedAt = new Date()
 
-    const updated = await collections.equipment.findOneAndUpdate(
-      { _id: equipment._id },
-      { $set: patch },
-      { returnDocument: "after" }
+    const currentQuantity = toNumber(
+      equipment.availableQuantity ?? equipment.quantity
     )
+    const reducingInventory =
+      patch.availableQuantity !== undefined &&
+      patch.availableQuantity < currentQuantity
+    const lockToken = reducingInventory
+      ? await acquireEquipmentReservationLock(equipment._id)
+      : null
 
-    if (!updated) return fail(res, 404, "Equipment not found.")
+    if (reducingInventory && !lockToken) {
+      return fail(
+        res,
+        409,
+        "Equipment is being booked. Please try the inventory update again."
+      )
+    }
 
-    const users = await loadUsers([toId(updated.ownerId ?? updated.owner?._id)])
-    return ok(res, normalizeEquipment(updated, users))
+    try {
+      if (
+        reducingInventory &&
+        patch.availableQuantity < (await maximumReservedQuantity(equipment._id))
+      ) {
+        return fail(
+          res,
+          409,
+          "Available quantity cannot be lower than units already reserved."
+        )
+      }
+
+      const updated = await collections.equipment.findOneAndUpdate(
+        { _id: equipment._id },
+        { $set: patch },
+        { returnDocument: "after" }
+      )
+
+      if (!updated) return fail(res, 404, "Equipment not found.")
+
+      const users = await loadUsers([toId(updated.ownerId ?? updated.owner?._id)])
+      return ok(res, normalizeEquipment(updated, users))
+    } finally {
+      if (lockToken) {
+        await releaseEquipmentReservationLock(equipment._id, lockToken)
+      }
+    }
   } catch (error) {
     return next(error)
   }

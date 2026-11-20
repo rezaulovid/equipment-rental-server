@@ -4,6 +4,9 @@ import { ObjectId } from "mongodb"
 import { collections } from "../lib/db.js"
 import {
   bookingLifecycleFilter,
+  acquireEquipmentReservationLock,
+  maximumReservedQuantity,
+  releaseEquipmentReservationLock,
 } from "../lib/records.js"
 import {
   BOOKING_STATUSES,
@@ -484,16 +487,54 @@ router.patch("/equipment/:id", async (req, res, next) => {
 
     patch.updatedAt = new Date()
 
-    const updated = await collections.equipment.findOneAndUpdate(
-      { _id },
-      { $set: patch },
-      { returnDocument: "after" }
+    const existing = await collections.equipment.findOne({ _id })
+    if (!existing) return fail(res, 404, "Equipment not found.")
+
+    const currentQuantity = toNumber(
+      existing.availableQuantity ?? existing.quantity
     )
+    const reducingInventory =
+      patch.availableQuantity !== undefined &&
+      patch.availableQuantity < currentQuantity
+    const lockToken = reducingInventory
+      ? await acquireEquipmentReservationLock(_id)
+      : null
 
-    if (!updated) return fail(res, 404, "Equipment not found.")
+    if (reducingInventory && !lockToken) {
+      return fail(
+        res,
+        409,
+        "Equipment is being booked. Please try the inventory update again."
+      )
+    }
 
-    const owners = await loadUsers([toId(updated.ownerId ?? updated.owner?._id)])
-    return ok(res, normalizeEquipment(updated, owners))
+    try {
+      if (
+        reducingInventory &&
+        patch.availableQuantity < (await maximumReservedQuantity(_id))
+      ) {
+        return fail(
+          res,
+          409,
+          "Available quantity cannot be lower than units already reserved."
+        )
+      }
+
+      const updated = await collections.equipment.findOneAndUpdate(
+        { _id },
+        { $set: patch },
+        { returnDocument: "after" }
+      )
+
+      if (!updated) return fail(res, 404, "Equipment not found.")
+
+      const owners = await loadUsers([toId(updated.ownerId ?? updated.owner?._id)])
+      return ok(res, normalizeEquipment(updated, owners))
+    } finally {
+      if (lockToken) {
+        await releaseEquipmentReservationLock(_id, lockToken)
+      }
+    }
   } catch (error) {
     return next(error)
   }
