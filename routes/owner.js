@@ -665,17 +665,46 @@ router.delete("/equipment/:id", async (req, res, next) => {
 
     if (!equipment) return fail(res, 404, "Equipment not found.")
 
-    const deleted = await collections.equipment.findOneAndDelete({
-      _id: equipment._id,
-    })
+    const lockToken = await acquireEquipmentReservationLock(equipment._id)
+    if (!lockToken) {
+      return fail(
+        res,
+        409,
+        "Equipment is being booked. Please try deleting it again."
+      )
+    }
 
-    // Booking history is kept on purpose: rentals snapshot the equipment they
-    // rented, so deleting a listing must not erase past or pending requests.
-    await collections.favorites.deleteMany({
-      $or: [{ equipmentId: req.params.id }, { equipmentId: equipment._id }],
-    })
+    try {
+      const outstandingBooking = await collections.bookings.findOne(
+        {
+          ...inventoryHoldFilter(equipment._id),
+          endDate: { $gt: new Date() },
+        },
+        { projection: { _id: 1 } }
+      )
+      if (outstandingBooking) {
+        return fail(
+          res,
+          409,
+          "Equipment cannot be deleted while it has active or upcoming rentals."
+        )
+      }
 
-    return ok(res, { id: toId(deleted?._id) })
+      const deleted = await collections.equipment.findOneAndDelete({
+        _id: equipment._id,
+      })
+      if (!deleted) return fail(res, 404, "Equipment not found.")
+
+      // Booking history is kept on purpose: rentals snapshot the equipment
+      // they rented, so deleting a listing must not erase past requests.
+      await collections.favorites.deleteMany({
+        $or: [{ equipmentId: req.params.id }, { equipmentId: equipment._id }],
+      })
+
+      return ok(res, { id: toId(deleted._id) })
+    } finally {
+      await releaseEquipmentReservationLock(equipment._id, lockToken)
+    }
   } catch (error) {
     return next(error)
   }

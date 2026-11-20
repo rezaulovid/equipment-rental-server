@@ -5,6 +5,7 @@ import { collections } from "../lib/db.js"
 import {
   bookingLifecycleFilter,
   acquireEquipmentReservationLock,
+  inventoryHoldFilter,
   maximumReservedQuantity,
   releaseEquipmentReservationLock,
 } from "../lib/records.js"
@@ -545,16 +546,47 @@ router.delete("/equipment/:id", async (req, res, next) => {
     const _id = parseId(req.params.id)
     if (!_id) return fail(res, 400, "Invalid equipment id.")
 
-    const deleted = await collections.equipment.findOneAndDelete({ _id })
-    if (!deleted) return fail(res, 404, "Equipment not found.")
+    const equipment = await collections.equipment.findOne({ _id })
+    if (!equipment) return fail(res, 404, "Equipment not found.")
 
-    // Keep favorites consistent with the public catalogue. Favorites may store
-    // the id as either a string or an ObjectId depending on the writer.
-    await collections.favorites.deleteMany({
-      $or: [{ equipmentId: req.params.id }, { equipmentId: _id }],
-    })
+    const lockToken = await acquireEquipmentReservationLock(_id)
+    if (!lockToken) {
+      return fail(
+        res,
+        409,
+        "Equipment is being booked. Please try deleting it again."
+      )
+    }
 
-    return ok(res, { id: req.params.id })
+    try {
+      const outstandingBooking = await collections.bookings.findOne(
+        {
+          ...inventoryHoldFilter(_id),
+          endDate: { $gt: new Date() },
+        },
+        { projection: { _id: 1 } }
+      )
+      if (outstandingBooking) {
+        return fail(
+          res,
+          409,
+          "Equipment cannot be deleted while it has active or upcoming rentals."
+        )
+      }
+
+      const deleted = await collections.equipment.findOneAndDelete({ _id })
+      if (!deleted) return fail(res, 404, "Equipment not found.")
+
+      // Keep favorites consistent with the public catalogue. Favorites may
+      // store the id as either a string or an ObjectId depending on the writer.
+      await collections.favorites.deleteMany({
+        $or: [{ equipmentId: req.params.id }, { equipmentId: _id }],
+      })
+
+      return ok(res, { id: req.params.id })
+    } finally {
+      await releaseEquipmentReservationLock(_id, lockToken)
+    }
   } catch (error) {
     return next(error)
   }
