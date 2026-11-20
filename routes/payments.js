@@ -45,7 +45,9 @@ router.get("/session/:sessionId", verifyToken, verifyRenter, async (req, res, ne
     if (session.payment_status === "paid") {
       result = await markCheckoutPaid(session)
     } else if (session.status === "expired") {
-      result = await markCheckoutFailed(session, "expired")
+      result = await markCheckoutFailed(session, "expired", {
+        cancelBooking: false,
+      })
     }
 
     const payment = await collections.payments.findOne({
@@ -120,11 +122,15 @@ export async function handleStripeWebhook(req, res) {
         break
 
       case "checkout.session.async_payment_failed":
-        await markCheckoutFailed(event.data.object, "async_payment_failed")
+        await markCheckoutFailed(event.data.object, "async_payment_failed", {
+          cancelBooking: false,
+        })
         break
 
       case "checkout.session.expired":
-        await markCheckoutFailed(event.data.object, "expired")
+        await markCheckoutFailed(event.data.object, "expired", {
+          cancelBooking: false,
+        })
         break
 
       case "payment_intent.payment_failed":

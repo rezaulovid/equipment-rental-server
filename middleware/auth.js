@@ -32,39 +32,41 @@ export async function verifyToken(req, res, next) {
     return respond(res, 401, "Authentication required.")
   }
 
+  let payload
   try {
-    const { payload } = await jwtVerify(token, jwks, {
+    const verified = await jwtVerify(token, jwks, {
       issuer,
       audience: issuer,
     })
-
-    if (!payload.sub || !ObjectId.isValid(payload.sub)) {
-      return respond(res, 401, "Invalid access token.")
-    }
-
-    const user = await collections.users.findOne(
-      { _id: new ObjectId(payload.sub) },
-      { projection: { name: 1, email: 1, image: 1, role: 1, phone: 1, address: 1 } }
-    )
-
-    if (!user) {
-      return respond(res, 401, "Account not found.")
-    }
-
-    req.user = {
-      id: user._id.toString(),
-      name: user.name ?? "",
-      email: user.email ?? "",
-      image: user.image ?? null,
-      phone: user.phone ?? null,
-      address: user.address ?? null,
-      role: user.role ?? "customer",
-    }
-
-    return next()
+    payload = verified.payload
   } catch {
     return respond(res, 401, "Invalid or expired access token.")
   }
+
+  if (!payload.sub || !ObjectId.isValid(payload.sub)) {
+    return respond(res, 401, "Invalid access token.")
+  }
+
+  const user = await collections.users.findOne(
+    { _id: new ObjectId(payload.sub) },
+    { projection: { name: 1, email: 1, image: 1, role: 1, phone: 1, address: 1 } }
+  )
+
+  if (!user) {
+    return respond(res, 401, "Account not found.")
+  }
+
+  req.user = {
+    id: user._id.toString(),
+    name: user.name ?? "",
+    email: user.email ?? "",
+    image: user.image ?? null,
+    phone: user.phone ?? null,
+    address: user.address ?? null,
+    role: user.role ?? "customer",
+  }
+
+  return next()
 }
 
 export function verifyAdmin(req, res, next) {

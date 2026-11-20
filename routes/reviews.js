@@ -3,9 +3,10 @@ import { ObjectId } from "mongodb"
 
 import { collections } from "../lib/db.js"
 import { toId } from "../lib/normalize.js"
+import { parsePagination } from "../lib/pagination.js"
 import {
-  customerOwnershipFilter,
   idCandidates,
+  customerOwnershipFilter,
 } from "../lib/records.js"
 import { verifyRenter, verifyToken } from "../middleware/auth.js"
 
@@ -28,12 +29,28 @@ function serializeReview(review) {
   }
 }
 
-router.get("/", async (_req, res, next) => {
+router.get("/", async (req, res, next) => {
   try {
+    const pagination = parsePagination(req.query, {
+      defaultLimit: 8,
+      maxLimit: 50,
+    })
+    if (pagination.error) return fail(res, 400, pagination.error)
+
+    const filter = { status: "approved" }
+    if (req.query.equipmentId !== undefined) {
+      const equipmentId = String(req.query.equipmentId).trim()
+      if (!ObjectId.isValid(equipmentId)) {
+        return fail(res, 400, "Invalid equipment id.")
+      }
+      filter.equipmentId = { $in: idCandidates(equipmentId) }
+    }
+
     const reviews = await collections.reviews
-      .find({ status: "approved" })
+      .find(filter)
       .sort({ createdAt: -1 })
-      .limit(8)
+      .skip(pagination.skip)
+      .limit(pagination.limit ?? 8)
       .toArray()
 
     return ok(res, reviews.map(serializeReview))

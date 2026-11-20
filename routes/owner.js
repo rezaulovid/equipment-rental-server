@@ -113,27 +113,39 @@ router.get("/analytics", async (req, res, next) => {
     )
 
     const [
-      equipmentDocs,
+      totalListings,
       statusGroups,
-      bookings,
-      payments,
+      completedRentals,
+      earningsRows,
       monthlyBookingRows,
       monthlyRevenueRows,
     ] = await Promise.all([
-      collections.equipment.find(ownerEquipmentFilter(req.user.id)).toArray(),
+      collections.equipment.countDocuments(ownerEquipmentFilter(req.user.id)),
       collections.equipment
         .aggregate([
           { $match: ownerEquipmentFilter(req.user.id) },
           { $group: { _id: "$status", count: { $sum: 1 } } },
         ])
         .toArray(),
-      collections.bookings.find(ownerBookingsFilter(req.user.id)).toArray(),
-      collections.payments
-        .find({
-          ownerId: { $in: idCandidates(req.user.id) },
-          status: "paid",
-        })
-        .toArray(),
+      collections.bookings.countDocuments({
+        ...ownerBookingsFilter(req.user.id),
+        $or: [
+          { bookingStatus: "completed" },
+          {
+            bookingStatus: { $exists: false },
+            status: "completed",
+          },
+        ],
+      }),
+      collections.payments.aggregate([
+        {
+          $match: {
+            ownerId: { $in: idCandidates(req.user.id) },
+            status: "paid",
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]).toArray(),
       collections.bookings
         .aggregate([
           {
@@ -209,27 +221,17 @@ router.get("/analytics", async (req, res, next) => {
       }
     })
 
-    const totalEarnings = payments.reduce(
-      (sum, payment) => sum + toNumber(payment.amount),
-      0
-    )
+    const totalEarnings = toNumber(earningsRows[0]?.total)
 
-    const countByStatus = (status) =>
-      equipmentDocs.filter(
-        (doc) => String(doc.status ?? "pending").toLowerCase() === status
-      ).length
+    const countByStatus = (status) => byStatus[status] ?? 0
 
     return ok(res, {
       equipmentByStatus: byStatus,
-      totalListings: equipmentDocs.length,
+      totalListings,
       pendingEquipment: countByStatus("pending"),
       approvedEquipment: countByStatus("approved"),
       rejectedEquipment: countByStatus("rejected"),
-      completedRentals: bookings.filter(
-        (booking) =>
-          String(booking.bookingStatus ?? booking.status ?? "pending").toLowerCase() ===
-          "completed"
-      ).length,
+      completedRentals,
       totalEarnings,
       monthly,
     })
@@ -695,17 +697,33 @@ router.patch("/rentals/:id/status", async (req, res, next) => {
       )
     }
 
+    if (
+      ["active", "completed"].includes(nextStatus) &&
+      String(booking.paymentStatus ?? "unpaid").toLowerCase() !== "paid"
+    ) {
+      return fail(res, 400, "Only paid rentals can be activated or completed.")
+    }
+
+    const lifecycleFilter =
+      booking.bookingStatus !== undefined && booking.bookingStatus !== null
+        ? { bookingStatus: booking.bookingStatus }
+        : booking.status !== undefined && booking.status !== null
+          ? { status: booking.status }
+          : { bookingStatus: { $exists: false }, status: { $exists: false } }
+    const updateFilter = { _id: booking._id, ...lifecycleFilter }
+    if (["active", "completed"].includes(nextStatus)) {
+      updateFilter.paymentStatus = "paid"
+    }
+
     const updated = await collections.bookings.findOneAndUpdate(
-      { _id: booking._id },
+      updateFilter,
       { $set: { bookingStatus: nextStatus, updatedAt: new Date() } },
       { returnDocument: "after" }
     )
 
-    if (!updated) return fail(res, 404, "Rental not found.")
-
-    const customers = await loadUsers([
-      toId(updated.customerId ?? updated.customer?._id ?? updated.userId),
-    ])
+    if (!updated) {
+      return fail(res, 409, "Rental status changed. Refresh and try again.")
+    }
 
     const [serialized] = await serializeOwnerBookings([updated])
 

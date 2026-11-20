@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "node --watch index.js",
     "start": "node index.js",
+    "test": "node --test",
     "set-role": "node scripts/set-role.mjs",
     "seed": "node scripts/seed-demo.mjs"
   },

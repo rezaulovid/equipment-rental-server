@@ -360,6 +360,39 @@ router.post("/:id/checkout", async (req, res, next) => {
       return fail(res, 404, "The equipment for this rental no longer exists.")
     }
 
+    const paymentAttempts = await collections.payments
+      .find({
+        bookingId: {
+          $in: [toId(booking._id), ...idCandidates(booking._id)],
+        },
+        status: { $in: ["pending", "failed"] },
+      })
+      .toArray()
+
+    for (const attempt of paymentAttempts) {
+      if (!attempt.stripeSessionId) continue
+
+      const result = await expireCheckoutForCustomer(
+        attempt.stripeSessionId,
+        req.user.id,
+        "superseded"
+      )
+
+      if (result.forbidden) {
+        return fail(res, 403, "This checkout does not belong to your account.")
+      }
+      if (result.paid) {
+        return fail(res, 409, "A previous checkout has already been paid.")
+      }
+      if (!result.cancelled) {
+        return fail(
+          res,
+          409,
+          "A previous checkout is still processing. Try again after its status is confirmed."
+        )
+      }
+    }
+
     const reserved = await reservedQuantity(
       equipment._id,
       booking.startDate,
@@ -405,7 +438,7 @@ router.post("/:id/checkout", async (req, res, next) => {
 
     await collections.payments.updateMany(
       {
-        bookingId: { $in: [toId(booking._id)] },
+        bookingId: { $in: [toId(booking._id), ...idCandidates(booking._id)] },
         status: { $in: ["pending", "failed"] },
       },
       { $set: { status: "failed", failureReason: "superseded", updatedAt: now } }

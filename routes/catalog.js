@@ -2,6 +2,7 @@ import { Router } from "express"
 
 import { collections } from "../lib/db.js"
 import { normalizeEquipment, toId, toNumber } from "../lib/normalize.js"
+import { parsePagination } from "../lib/pagination.js"
 import {
   byIdFilter,
   equipmentByIdFilter,
@@ -35,19 +36,6 @@ function parsePrice(value, field) {
   return price
 }
 
-function parseLimit(value) {
-  if (value === undefined || value === "") return undefined
-
-  const limit = Number(value)
-  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-    const error = new Error("Limit must be a whole number between 1 and 100.")
-    error.status = 400
-    throw error
-  }
-
-  return limit
-}
-
 const rentalTypeAliases = {
   daily: ["daily", "day"],
   weekly: ["weekly", "week"],
@@ -67,7 +55,63 @@ router.get("/", async (req, res, next) => {
     const sort = String(req.query.sort ?? "recent").trim().toLowerCase()
     const minPrice = parsePrice(req.query.minPrice, "Minimum price")
     const maxPrice = parsePrice(req.query.maxPrice, "Maximum price")
-    const limit = parseLimit(req.query.limit)
+    const pagination = parsePagination(req.query)
+    if (pagination.error) return fail(res, 400, pagination.error)
+
+    const hasAvailabilityDates =
+      req.query.startDate !== undefined || req.query.endDate !== undefined
+    const hasAvailabilityQuantity = req.query.quantity !== undefined
+
+    if ((hasAvailabilityDates || hasAvailabilityQuantity) && !availability) {
+      return fail(
+        res,
+        400,
+        "Availability dates and quantity require an availability filter."
+      )
+    }
+
+    let availabilityStart
+    let availabilityEnd
+    let requestedQuantity = 1
+
+    if (availability) {
+      if (hasAvailabilityDates) {
+        if (req.query.startDate === undefined || req.query.endDate === undefined) {
+          return fail(
+            res,
+            400,
+            "Both startDate and endDate are required for availability checks."
+          )
+        }
+
+        const dates = validateRentalDates(
+          req.query.startDate,
+          req.query.endDate
+        )
+        if (!dates.valid) return fail(res, 400, dates.message)
+        availabilityStart = dates.startDate
+        availabilityEnd = dates.endDate
+      } else {
+        availabilityStart = new Date()
+        availabilityStart.setUTCHours(0, 0, 0, 0)
+        availabilityEnd = new Date(availabilityStart.getTime() + 86_400_000)
+      }
+
+      if (hasAvailabilityQuantity) {
+        requestedQuantity = Number(req.query.quantity)
+        if (
+          !Number.isInteger(requestedQuantity) ||
+          requestedQuantity < 1 ||
+          requestedQuantity > 10_000
+        ) {
+          return fail(
+            res,
+            400,
+            "Availability quantity must be a whole number between 1 and 10000."
+          )
+        }
+      }
+    }
 
     if (minPrice !== undefined && maxPrice !== undefined && minPrice > maxPrice) {
       return fail(res, 400, "Minimum price cannot be greater than maximum price.")
@@ -149,31 +193,45 @@ router.get("/", async (req, res, next) => {
       sort === "recent"
         ? { createdAt: -1, _id: -1 }
         : { _catalogPrice: sort === "price-asc" ? 1 : -1, _id: 1 }
+    const pipeline = [
+      { $match: filter },
+      { $addFields: { _catalogPrice: priceExpression } },
+      { $sort: sortField },
+    ]
+
+    if (pagination.requested && !availability) {
+      pipeline.push(
+        { $skip: pagination.skip },
+        { $limit: pagination.limit ?? 24 }
+      )
+    }
+
     let docs = await collections.equipment
-      .aggregate([
-        { $match: filter },
-        { $addFields: { _catalogPrice: priceExpression } },
-        { $sort: sortField },
-      ])
+      .aggregate(pipeline)
       .toArray()
 
     if (availability) {
-      const dayStart = new Date()
-      dayStart.setUTCHours(0, 0, 0, 0)
-      const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000)
       const equipmentIds = docs.flatMap((doc) => idCandidates(doc._id))
       const overlapping = equipmentIds.length
         ? await collections.bookings
             .find({
               equipmentId: { $in: equipmentIds },
               bookingStatus: { $in: ["pending", "active"] },
-              startDate: { $lt: dayEnd },
-              endDate: { $gt: dayStart },
+              startDate: { $lt: availabilityEnd },
+              endDate: { $gt: availabilityStart },
               $or: [
                 { paymentStatus: "paid" },
                 {
                   paymentStatus: { $in: ["pending", "unpaid"] },
-                  createdAt: { $gte: new Date(Date.now() - 35 * 60 * 1000) },
+                  $or: [
+                    { checkoutExpiresAt: { $gte: new Date() } },
+                    {
+                      checkoutExpiresAt: { $exists: false },
+                      createdAt: {
+                        $gte: new Date(Date.now() - 35 * 60 * 1000),
+                      },
+                    },
+                  ],
                 },
               ],
             })
@@ -192,13 +250,13 @@ router.get("/", async (req, res, next) => {
       docs = docs.filter((doc) => {
         const quantity = toNumber(doc.availableQuantity ?? doc.quantity, 0)
         const reserved = reservedByEquipment.get(toId(doc._id)) ?? 0
-        const isAvailable = quantity - reserved > 0
+        const isAvailable = quantity - reserved >= requestedQuantity
         return availability === "available" ? isAvailable : !isAvailable
       })
     }
 
-    if (limit !== undefined) {
-      docs = docs.slice(0, limit)
+    if (pagination.requested && availability) {
+      docs = docs.slice(pagination.skip, pagination.skip + pagination.limit)
     }
 
     const owners = await collections.users
@@ -211,7 +269,6 @@ router.get("/", async (req, res, next) => {
         },
       })
       .toArray()
-      .catch(() => [])
 
     const ownerMap = Object.fromEntries(
       owners.map((owner) => [

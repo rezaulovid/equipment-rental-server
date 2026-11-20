@@ -44,11 +44,11 @@ startup.
 
 ## Main endpoints
 
-- `/api/equipment` — approved public catalogue, search and filters
+- `/api/equipment` — approved public catalogue, search, filters, and optional `page`/`limit` pagination. Availability filters accept `startDate`, `endDate`, and `quantity`.
 - `/api/favorites` — customer favorites
 - `/api/bookings` — customer rental and checkout initiation
 - `/api/payments` — payment confirmation, cancellation, and Stripe webhook
-- `/api/reviews` — verified customer reviews
+- `/api/reviews` — verified customer reviews; public retrieval can be scoped with `equipmentId` and paginated with `page`/`limit`
 - `/api/customer` — customer profile, rentals, and payments
 - `/api/owner` — owner equipment, rentals, and analytics
 - `/api/admin` — admin management and platform analytics

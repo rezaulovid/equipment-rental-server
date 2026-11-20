@@ -545,13 +545,33 @@ router.patch("/rentals/:id/status", async (req, res, next) => {
       )
     }
 
+    if (
+      ["active", "completed"].includes(nextStatus) &&
+      String(booking.paymentStatus ?? "unpaid").toLowerCase() !== "paid"
+    ) {
+      return fail(res, 400, "Only paid rentals can be activated or completed.")
+    }
+
+    const lifecycleFilter =
+      booking.bookingStatus !== undefined && booking.bookingStatus !== null
+        ? { bookingStatus: booking.bookingStatus }
+        : booking.status !== undefined && booking.status !== null
+          ? { status: booking.status }
+          : { bookingStatus: { $exists: false }, status: { $exists: false } }
+    const updateFilter = { _id, ...lifecycleFilter }
+    if (["active", "completed"].includes(nextStatus)) {
+      updateFilter.paymentStatus = "paid"
+    }
+
     const updated = await collections.bookings.findOneAndUpdate(
-      { _id },
+      updateFilter,
       { $set: { bookingStatus: nextStatus, updatedAt: new Date() } },
       { returnDocument: "after" }
     )
 
-    if (!updated) return fail(res, 404, "Rental not found.")
+    if (!updated) {
+      return fail(res, 409, "Rental status changed. Refresh and try again.")
+    }
 
     const users = await loadUsers([
       toId(updated.customerId ?? updated.customer?._id ?? updated.userId),
