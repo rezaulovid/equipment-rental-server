@@ -6,6 +6,7 @@ import {
   BOOKING_STATUSES,
   BOOKING_TRANSITIONS,
   EQUIPMENT_STATUSES,
+  isSupportedRentalType,
   normalizeBooking,
   normalizeEquipment,
   normalizePayment,
@@ -429,10 +430,10 @@ function validateOwnerEquipmentInput(body) {
     return { error: "Rental price must be a positive number." }
   }
 
-  const rentalType = normalizeRentalType(body?.rentalType)
-  if (!["daily", "weekly", "monthly"].includes(rentalType)) {
+  if (!isSupportedRentalType(body?.rentalType)) {
     return { error: "Rental type must be daily, weekly or monthly." }
   }
+  const rentalType = normalizeRentalType(body.rentalType)
 
   const availableQuantity = Number(body?.availableQuantity)
   if (!Number.isInteger(availableQuantity) || availableQuantity < 1) {
@@ -590,6 +591,9 @@ router.patch("/equipment/:id", async (req, res, next) => {
     }
 
     if (req.body?.rentalType !== undefined) {
+      if (!isSupportedRentalType(req.body.rentalType)) {
+        return fail(res, 400, "Rental type must be daily, weekly or monthly.")
+      }
       patch.rentalType = normalizeRentalType(req.body.rentalType)
     }
 

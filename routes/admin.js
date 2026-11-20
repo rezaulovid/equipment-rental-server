@@ -10,6 +10,7 @@ import {
   BOOKING_TRANSITIONS,
   EQUIPMENT_STATUSES,
   USER_ROLES,
+  isSupportedRentalType,
   normalizeBooking,
   normalizeEquipment,
   normalizeRentalType,
@@ -455,6 +456,9 @@ router.patch("/equipment/:id", async (req, res, next) => {
     }
 
     if (body.rentalType !== undefined) {
+      if (!isSupportedRentalType(body.rentalType)) {
+        return fail(res, 400, "Rental type must be daily, weekly or monthly.")
+      }
       patch.rentalType = normalizeRentalType(body.rentalType)
     }
 
