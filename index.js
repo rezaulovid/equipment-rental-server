@@ -12,6 +12,7 @@ import customerRouter from "./routes/customer.js"
 import favoritesRouter from "./routes/favorites.js"
 import ownerRouter from "./routes/owner.js"
 import paymentsRouter, { handleStripeWebhook } from "./routes/payments.js"
+import reviewsRouter from "./routes/reviews.js"
 
 const app = express()
 const port = Number(process.env.PORT ?? 5000)
@@ -53,7 +54,7 @@ app.get("/health", (_req, res) => {
   res.json({ success: true, status: "ok", uptime: process.uptime() })
 })
 
-app.get("/users", verifyToken, verifyAdmin, async (_req, res, next) => {
+app.get("/users",verifyToken,verifyAdmin, async (_req, res, next) => {
   try {
     const docs = await collections.users
       .find({}, { projection: { password: 0 } })
@@ -77,6 +78,7 @@ app.use("/api/customer", customerRouter)
 app.use("/api/bookings", bookingsRouter)
 app.use("/api/owner", ownerRouter)
 app.use("/api/payments", paymentsRouter)
+app.use("/api/reviews", reviewsRouter)
 
 app.use((_req, res) => {
   res.status(404).json({ success: false, message: "Route not found." })

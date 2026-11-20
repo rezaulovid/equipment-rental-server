@@ -22,24 +22,81 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
+function parsePrice(value, field) {
+  if (value === undefined || value === "") return undefined
+
+  const price = Number(value)
+  if (!Number.isFinite(price) || price < 0) {
+    const error = new Error(`${field} must be a non-negative number.`)
+    error.status = 400
+    throw error
+  }
+
+  return price
+}
+
+function parseLimit(value) {
+  if (value === undefined || value === "") return undefined
+
+  const limit = Number(value)
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    const error = new Error("Limit must be a whole number between 1 and 100.")
+    error.status = 400
+    throw error
+  }
+
+  return limit
+}
+
+const rentalTypeAliases = {
+  daily: ["daily", "day"],
+  weekly: ["weekly", "week"],
+  monthly: ["monthly", "month"],
+}
+
 /** Public catalogue: only approved equipment is ever visible to customers. */
 router.get("/", async (req, res, next) => {
   try {
     const filter = { status: "approved" }
+    const additionalClauses = []
     const search = String(req.query.q ?? "").trim()
     const category = String(req.query.category ?? "").trim()
     const location = String(req.query.location ?? "").trim()
+    const rentalType = String(req.query.rentalType ?? "").trim().toLowerCase()
+    const availability = String(req.query.availability ?? "").trim().toLowerCase()
+    const sort = String(req.query.sort ?? "recent").trim().toLowerCase()
+    const minPrice = parsePrice(req.query.minPrice, "Minimum price")
+    const maxPrice = parsePrice(req.query.maxPrice, "Maximum price")
+    const limit = parseLimit(req.query.limit)
+
+    if (minPrice !== undefined && maxPrice !== undefined && minPrice > maxPrice) {
+      return fail(res, 400, "Minimum price cannot be greater than maximum price.")
+    }
+
+    if (rentalType && !rentalTypeAliases[rentalType]) {
+      return fail(res, 400, "Rental type must be daily, weekly, or monthly.")
+    }
+
+    if (availability && !["available", "unavailable"].includes(availability)) {
+      return fail(res, 400, "Availability must be available or unavailable.")
+    }
+
+    if (!["recent", "price-asc", "price-desc"].includes(sort)) {
+      return fail(res, 400, "Sort must be recent, price-asc, or price-desc.")
+    }
 
     if (search) {
       const pattern = new RegExp(escapeRegExp(search), "i")
-      filter.$or = [
-        { name: pattern },
-        { description: pattern },
-        { category: pattern },
-        { brand: pattern },
-        { model: pattern },
-        { location: pattern },
-      ]
+      additionalClauses.push({
+        $or: [
+          { name: pattern },
+          { description: pattern },
+          { category: pattern },
+          { brand: pattern },
+          { model: pattern },
+          { location: pattern },
+        ],
+      })
     }
 
     if (category && category !== "all") {
@@ -53,10 +110,96 @@ router.get("/", async (req, res, next) => {
       filter.location = new RegExp(escapeRegExp(location), "i")
     }
 
-    const docs = await collections.equipment
-      .find(filter)
-      .sort({ createdAt: -1 })
+    if (rentalType) {
+      additionalClauses.push({
+        $or: [
+          { rentalType: { $in: rentalTypeAliases[rentalType] } },
+          {
+            rentalType: { $in: [null, ""] },
+            rentalPeriod: { $in: rentalTypeAliases[rentalType] },
+          },
+        ],
+      })
+    }
+
+    if (additionalClauses.length > 0) {
+      filter.$and = additionalClauses
+    }
+
+    const priceExpression = {
+      $convert: {
+        input: { $ifNull: ["$rentalPrice", "$price"] },
+        to: "double",
+        onError: 0,
+        onNull: 0,
+      },
+    }
+    const priceConditions = []
+    if (minPrice !== undefined) {
+      priceConditions.push({ $gte: [priceExpression, minPrice] })
+    }
+    if (maxPrice !== undefined) {
+      priceConditions.push({ $lte: [priceExpression, maxPrice] })
+    }
+    if (priceConditions.length > 0) {
+      filter.$expr = { $and: priceConditions }
+    }
+
+    const sortField =
+      sort === "recent"
+        ? { createdAt: -1, _id: -1 }
+        : { _catalogPrice: sort === "price-asc" ? 1 : -1, _id: 1 }
+    let docs = await collections.equipment
+      .aggregate([
+        { $match: filter },
+        { $addFields: { _catalogPrice: priceExpression } },
+        { $sort: sortField },
+      ])
       .toArray()
+
+    if (availability) {
+      const dayStart = new Date()
+      dayStart.setUTCHours(0, 0, 0, 0)
+      const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000)
+      const equipmentIds = docs.flatMap((doc) => idCandidates(doc._id))
+      const overlapping = equipmentIds.length
+        ? await collections.bookings
+            .find({
+              equipmentId: { $in: equipmentIds },
+              bookingStatus: { $in: ["pending", "active"] },
+              startDate: { $lt: dayEnd },
+              endDate: { $gt: dayStart },
+              $or: [
+                { paymentStatus: "paid" },
+                {
+                  paymentStatus: { $in: ["pending", "unpaid"] },
+                  createdAt: { $gte: new Date(Date.now() - 35 * 60 * 1000) },
+                },
+              ],
+            })
+            .toArray()
+        : []
+
+      const reservedByEquipment = new Map()
+      for (const booking of overlapping) {
+        const id = toId(booking.equipmentId)
+        reservedByEquipment.set(
+          id,
+          (reservedByEquipment.get(id) ?? 0) + toNumber(booking.quantity, 1)
+        )
+      }
+
+      docs = docs.filter((doc) => {
+        const quantity = toNumber(doc.availableQuantity ?? doc.quantity, 0)
+        const reserved = reservedByEquipment.get(toId(doc._id)) ?? 0
+        const isAvailable = quantity - reserved > 0
+        return availability === "available" ? isAvailable : !isAvailable
+      })
+    }
+
+    if (limit !== undefined) {
+      docs = docs.slice(0, limit)
+    }
 
     const owners = await collections.users
       .find({
@@ -78,6 +221,24 @@ router.get("/", async (req, res, next) => {
     )
 
     return ok(res, docs.map((doc) => normalizeEquipment(doc, ownerMap)))
+  } catch (error) {
+    return next(error)
+  }
+})
+
+router.get("/categories", async (_req, res, next) => {
+  try {
+    const categories = await collections.equipment.distinct("category", {
+      status: "approved",
+    })
+
+    return ok(
+      res,
+      categories
+        .filter((category) => typeof category === "string" && category.trim())
+        .map((category) => category.trim())
+        .sort((a, b) => a.localeCompare(b))
+    )
   } catch (error) {
     return next(error)
   }

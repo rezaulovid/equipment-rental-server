@@ -3,15 +3,16 @@ import { ObjectId } from "mongodb"
 
 import { collections } from "../lib/db.js"
 import { createBookingCheckout } from "../lib/checkout.js"
+import { toId, toNumber } from "../lib/normalize.js"
 import {
-  toId,
-  toNumber,
-} from "../lib/normalize.js"
-import {
+  acquireEquipmentReservationLock,
   customerOwnershipFilter,
   equipmentByIdFilter,
+  idCandidates,
   inventoryHoldFilter,
+  releaseEquipmentReservationLock,
 } from "../lib/records.js"
+import { expireCheckoutForCustomer } from "../lib/payments.js"
 import {
   calculateRentalTotal,
   normalizeRentalType,
@@ -127,7 +128,7 @@ router.post("/", async (req, res, next) => {
     const input = validateBookingInput(req.body ?? {})
     if (input.error) return fail(res, 400, input.error)
 
-    const equipment = await collections.equipment.findOne(
+    let equipment = await collections.equipment.findOne(
       equipmentByIdFilter(input.equipmentId)
     )
 
@@ -135,89 +136,129 @@ router.post("/", async (req, res, next) => {
       return fail(res, 404, "This equipment is not available to rent.")
     }
 
-    const totalQuantity = equipmentQuantity(equipment)
-    if (totalQuantity < 1) {
-      return fail(res, 409, "This equipment is currently unavailable.")
-    }
-
-    if (input.quantity > totalQuantity) {
-      return fail(
-        res,
-        400,
-        `Only ${totalQuantity} unit${totalQuantity === 1 ? "" : "s"} of this equipment exist.`
-      )
-    }
-
-    const reserved = await reservedQuantity(
-      equipment._id,
-      input.startDate,
-      input.endDate
-    )
-    const available = Math.max(totalQuantity - reserved, 0)
-
-    if (input.quantity > available) {
+    const reservationEquipmentId = equipment._id
+    const lockToken = await acquireEquipmentReservationLock(reservationEquipmentId)
+    if (!lockToken) {
       return fail(
         res,
         409,
-        available === 0
-          ? "This equipment is fully booked for the selected dates."
-          : `Only ${available} unit${available === 1 ? "" : "s"} available for the selected dates.`
+        "Another booking is being created for this equipment. Please try again."
       )
     }
 
-    const pricing = calculateRentalTotal({
-      rentalPrice: equipment.rentalPrice ?? equipment.price,
-      rentalType: equipment.rentalType ?? equipment.rentalPeriod,
-      startDate: input.startDate,
-      endDate: input.endDate,
-      quantity: input.quantity,
-    })
+    let pricing
+    let bookingDoc
+    let inserted
+    let paymentId
 
-    if (pricing.totalAmount <= 0) {
-      return fail(res, 400, "The rental amount could not be calculated.")
+    try {
+      equipment = await collections.equipment.findOne({ _id: equipment._id })
+      if (!equipment || String(equipment.status).toLowerCase() !== "approved") {
+        return fail(res, 404, "This equipment is not available to rent.")
+      }
+
+      const totalQuantity = equipmentQuantity(equipment)
+      if (totalQuantity < 1) {
+        return fail(res, 409, "This equipment is currently unavailable.")
+      }
+
+      if (input.quantity > totalQuantity) {
+        return fail(
+          res,
+          400,
+          `Only ${totalQuantity} unit${totalQuantity === 1 ? "" : "s"} of this equipment exist.`
+        )
+      }
+
+      const reserved = await reservedQuantity(
+        equipment._id,
+        input.startDate,
+        input.endDate
+      )
+      const available = Math.max(totalQuantity - reserved, 0)
+
+      if (input.quantity > available) {
+        return fail(
+          res,
+          409,
+          available === 0
+            ? "This equipment is fully booked for the selected dates."
+            : `Only ${available} unit${available === 1 ? "" : "s"} available for the selected dates.`
+        )
+      }
+
+      pricing = calculateRentalTotal({
+        rentalPrice: equipment.rentalPrice ?? equipment.price,
+        rentalType: equipment.rentalType ?? equipment.rentalPeriod,
+        startDate: input.startDate,
+        endDate: input.endDate,
+        quantity: input.quantity,
+      })
+
+      if (pricing.totalAmount <= 0) {
+        return fail(res, 400, "The rental amount could not be calculated.")
+      }
+
+      const now = new Date()
+      bookingDoc = {
+        equipmentId: toId(equipment._id),
+        equipmentName: equipment.name ?? "Equipment",
+        equipmentImage: equipment.image ?? "",
+        equipmentCategory: equipment.category ?? "",
+        customerId: req.user.id,
+        customerName: req.user.name,
+        customerEmail: req.user.email,
+        ownerId: toId(equipment.ownerId),
+        ownerName: equipment.ownerName ?? "",
+        ownerEmail: equipment.ownerEmail ?? "",
+        startDate: input.startDate,
+        endDate: input.endDate,
+        durationDays: pricing.durationDays,
+        billableUnits: pricing.billableUnits,
+        rentalType: normalizeRentalType(
+          equipment.rentalType ?? equipment.rentalPeriod
+        ),
+        unitPrice: pricing.unitPrice,
+        quantity: input.quantity,
+        contactNumber: input.contactNumber,
+        deliveryAddress: input.deliveryAddress,
+        notes: input.notes,
+        totalAmount: pricing.totalAmount,
+        currency: stripeCurrency,
+        paymentStatus: "pending",
+        bookingStatus: "pending",
+        checkoutExpiresAt: new Date(now.getTime() + 35 * 60 * 1000),
+        createdAt: now,
+        updatedAt: now,
+      }
+
+      inserted = await collections.bookings.insertOne(bookingDoc)
+      paymentId = await createPendingPayment(
+        inserted.insertedId,
+        req.user.id,
+        pricing.totalAmount,
+        equipment.ownerId
+      )
+    } catch (error) {
+      if (inserted?.insertedId && !paymentId) {
+        await collections.bookings.updateOne(
+          { _id: inserted.insertedId },
+          {
+            $set: {
+              bookingStatus: "cancelled",
+              paymentStatus: "failed",
+              updatedAt: new Date(),
+            },
+          }
+        )
+      }
+
+      throw error
+    } finally {
+      await releaseEquipmentReservationLock(reservationEquipmentId, lockToken)
     }
 
-    const now = new Date()
-    const bookingDoc = {
-      equipmentId: toId(equipment._id),
-      equipmentName: equipment.name ?? "Equipment",
-      equipmentImage: equipment.image ?? "",
-      equipmentCategory: equipment.category ?? "",
-      customerId: req.user.id,
-      customerName: req.user.name,
-      customerEmail: req.user.email,
-      ownerId: toId(equipment.ownerId),
-      ownerName: equipment.ownerName ?? "",
-      ownerEmail: equipment.ownerEmail ?? "",
-      startDate: input.startDate,
-      endDate: input.endDate,
-      durationDays: pricing.durationDays,
-      billableUnits: pricing.billableUnits,
-      rentalType: normalizeRentalType(
-        equipment.rentalType ?? equipment.rentalPeriod
-      ),
-      unitPrice: pricing.unitPrice,
-      quantity: input.quantity,
-      contactNumber: input.contactNumber,
-      deliveryAddress: input.deliveryAddress,
-      notes: input.notes,
-      totalAmount: pricing.totalAmount,
-      currency: stripeCurrency,
-      paymentStatus: "pending",
-      bookingStatus: "pending",
-      createdAt: now,
-      updatedAt: now,
-    }
-
-    const inserted = await collections.bookings.insertOne(bookingDoc)
     const bookingId = inserted.insertedId
-
-    const paymentId = await createPendingPayment(
-      bookingId,
-      req.user.id,
-      pricing.totalAmount,
-      equipment.ownerId
-    )
 
     try {
       const session = await createBookingCheckout({
@@ -466,7 +507,58 @@ router.post("/:id/cancel", async (req, res, next) => {
       return fail(res, 400, "Paid or active rentals cannot be cancelled here.")
     }
 
-    if (bookingStatus === "cancelled") {
+    const paymentAttempts = await collections.payments
+      .find({
+        bookingId: {
+          $in: [toId(booking._id), ...idCandidates(booking._id)],
+        },
+        status: { $in: ["pending", "failed"] },
+      })
+      .toArray()
+
+    for (const attempt of paymentAttempts) {
+      if (!attempt.stripeSessionId) continue
+
+      const result = await expireCheckoutForCustomer(
+        attempt.stripeSessionId,
+        req.user.id
+      )
+
+      if (result.forbidden) {
+        return fail(res, 403, "This checkout does not belong to your account.")
+      }
+      if (result.paid) {
+        return fail(res, 400, "A paid rental cannot be cancelled here.")
+      }
+      if (!result.cancelled) {
+        return fail(
+          res,
+          409,
+          "A checkout is still processing. Wait for its payment status before cancelling."
+        )
+      }
+    }
+
+    const currentBooking = await collections.bookings.findOne({
+      _id: booking._id,
+    })
+    if (!currentBooking) return fail(res, 404, "Rental not found.")
+
+    const currentPaymentStatus = String(
+      currentBooking?.paymentStatus ?? "unpaid"
+    ).toLowerCase()
+    const currentBookingStatus = String(
+      currentBooking?.bookingStatus ?? currentBooking?.status ?? "pending"
+    ).toLowerCase()
+
+    if (
+      currentPaymentStatus === "paid" ||
+      ["active", "completed"].includes(currentBookingStatus)
+    ) {
+      return fail(res, 400, "Paid or active rentals cannot be cancelled here.")
+    }
+
+    if (currentBookingStatus === "cancelled") {
       return ok(res, {
         id: toId(booking._id),
         bookingStatus: "cancelled",
@@ -476,8 +568,12 @@ router.post("/:id/cancel", async (req, res, next) => {
 
     const now = new Date()
 
-    await collections.bookings.updateOne(
-      { _id: booking._id },
+    const cancellation = await collections.bookings.updateOne(
+      {
+        _id: booking._id,
+        paymentStatus: { $ne: "paid" },
+        bookingStatus: "pending",
+      },
       {
         $set: {
           bookingStatus: "cancelled",
@@ -486,6 +582,14 @@ router.post("/:id/cancel", async (req, res, next) => {
         },
       }
     )
+
+    if (cancellation.modifiedCount !== 1) {
+      return fail(
+        res,
+        409,
+        "The rental status changed before it could be cancelled. Refresh and try again."
+      )
+    }
 
     await collections.payments.updateMany(
       {

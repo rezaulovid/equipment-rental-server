@@ -5,6 +5,7 @@ import {
   markCheckoutFailed,
   markCheckoutPaid,
   markPaymentIntentFailed,
+  expireCheckoutForCustomer,
   sessionBelongsToCustomer,
 } from "../lib/payments.js"
 import { stripe } from "../lib/stripe.js"
@@ -164,13 +165,28 @@ router.post("/cancel", verifyToken, verifyRenter, async (req, res, next) => {
 
     if (!stripe) return fail(res, 503, "Online payments are not configured yet.")
 
-    const session = await stripe.checkout.sessions.retrieve(sessionId)
+    const result = await expireCheckoutForCustomer(
+      sessionId,
+      req.user.id,
+      "cancelled"
+    )
 
-    if (!sessionBelongsToCustomer(session, req.user.id)) {
+    if (result.forbidden) {
       return fail(res, 403, "This payment does not belong to your account.")
     }
 
-    await markCheckoutFailed(session, "cancelled")
+    if (result.paid) {
+      return fail(res, 409, "This checkout has already been paid.")
+    }
+
+    if (!result.cancelled) {
+      return fail(
+        res,
+        409,
+        "This checkout is still processing and cannot be cancelled yet."
+      )
+    }
+
     return ok(res, { cancelled: true })
   } catch (error) {
     return next(error)

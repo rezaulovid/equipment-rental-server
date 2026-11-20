@@ -122,7 +122,10 @@ router.get("/analytics", async (req, res, next) => {
     ] = await Promise.all([
       collections.equipment.find(ownerEquipmentFilter(req.user.id)).toArray(),
       collections.equipment
-        .aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }])
+        .aggregate([
+          { $match: ownerEquipmentFilter(req.user.id) },
+          { $group: { _id: "$status", count: { $sum: 1 } } },
+        ])
         .toArray(),
       collections.bookings.find(ownerBookingsFilter(req.user.id)).toArray(),
       collections.payments
