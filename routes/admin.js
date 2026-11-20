@@ -242,6 +242,43 @@ router.patch("/users/:id/role", async (req, res, next) => {
   }
 })
 
+router.patch("/users/:id/ban", async (req, res, next) => {
+  try {
+    const _id = parseId(req.params.id)
+    if (!_id) return fail(res, 400, "Invalid user id.")
+
+    if (typeof req.body?.banned !== "boolean") {
+      return fail(res, 400, "banned must be a boolean.")
+    }
+    if (_id.toString() === req.user.id && req.body.banned) {
+      return fail(res, 400, "You cannot suspend your own account.")
+    }
+
+    const banReason = String(req.body?.banReason ?? "").trim()
+    if (req.body.banned && (banReason.length < 3 || banReason.length > 500)) {
+      return fail(res, 400, "Ban reason must be between 3 and 500 characters.")
+    }
+
+    const updated = await collections.users.findOneAndUpdate(
+      { _id },
+      {
+        $set: {
+          banned: req.body.banned,
+          banReason: req.body.banned ? banReason : null,
+          banExpires: null,
+          updatedAt: new Date(),
+        },
+      },
+      { returnDocument: "after", projection: { password: 0 } }
+    )
+
+    if (!updated) return fail(res, 404, "User not found.")
+    return ok(res, normalizeUser(updated))
+  } catch (error) {
+    return next(error)
+  }
+})
+
 router.patch("/users/:id", async (req, res, next) => {
   try {
     const _id = parseId(req.params.id)

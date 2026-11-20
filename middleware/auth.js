@@ -49,11 +49,29 @@ export async function verifyToken(req, res, next) {
 
   const user = await collections.users.findOne(
     { _id: new ObjectId(payload.sub) },
-    { projection: { name: 1, email: 1, image: 1, role: 1, phone: 1, address: 1 } }
+    {
+      projection: {
+        name: 1,
+        email: 1,
+        image: 1,
+        role: 1,
+        phone: 1,
+        address: 1,
+        banned: 1,
+        banExpires: 1,
+      },
+    }
   )
 
   if (!user) {
     return respond(res, 401, "Account not found.")
+  }
+
+  if (
+    user.banned &&
+    (!user.banExpires || new Date(user.banExpires).getTime() > Date.now())
+  ) {
+    return respond(res, 403, "This account is suspended.")
   }
 
   req.user = {
