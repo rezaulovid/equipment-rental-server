@@ -15,6 +15,7 @@ import {
   toNumber,
 } from "../lib/normalize.js"
 import {
+  bookingLifecycleFilter,
   equipmentByIdFilter,
   idCandidates,
   inventoryHoldFilter,
@@ -722,13 +723,10 @@ router.patch("/rentals/:id/status", async (req, res, next) => {
       return fail(res, 400, "Only paid rentals can be activated or completed.")
     }
 
-    const lifecycleFilter =
-      booking.bookingStatus !== undefined && booking.bookingStatus !== null
-        ? { bookingStatus: booking.bookingStatus }
-        : booking.status !== undefined && booking.status !== null
-          ? { status: booking.status }
-          : { bookingStatus: { $exists: false }, status: { $exists: false } }
-    const updateFilter = { _id: booking._id, ...lifecycleFilter }
+    const updateFilter = {
+      _id: booking._id,
+      ...bookingLifecycleFilter(booking),
+    }
     if (["active", "completed"].includes(nextStatus)) {
       updateFilter.paymentStatus = "paid"
     }
