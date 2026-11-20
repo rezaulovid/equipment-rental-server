@@ -267,7 +267,7 @@ router.get("/", async (req, res, next) => {
             .filter(Boolean)
             .flatMap(idCandidates),
         },
-      })
+      }, { projection: { name: 1, email: 1 } })
       .toArray()
 
     const ownerMap = Object.fromEntries(
@@ -372,7 +372,9 @@ router.get("/:id", async (req, res, next) => {
     }
 
     const owner = equipment.ownerId
-      ? await collections.users.findOne(byIdFilter(equipment.ownerId))
+      ? await collections.users.findOne(byIdFilter(equipment.ownerId), {
+          projection: { name: 1, email: 1 },
+        })
       : null
 
     const ownerMap = owner

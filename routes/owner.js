@@ -132,6 +132,10 @@ router.get("/analytics", async (req, res, next) => {
         $or: [
           { bookingStatus: "completed" },
           {
+            bookingStatus: null,
+            status: "completed",
+          },
+          {
             bookingStatus: { $exists: false },
             status: "completed",
           },
@@ -144,7 +148,21 @@ router.get("/analytics", async (req, res, next) => {
             status: "paid",
           },
         },
-        { $group: { _id: null, total: { $sum: "$amount" } } },
+        {
+          $group: {
+            _id: null,
+            total: {
+              $sum: {
+                $convert: {
+                  input: "$amount",
+                  to: "double",
+                  onError: 0,
+                  onNull: 0,
+                },
+              },
+            },
+          },
+        },
       ]).toArray(),
       collections.bookings
         .aggregate([
