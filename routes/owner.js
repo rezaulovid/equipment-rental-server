@@ -27,6 +27,7 @@ import {
   loadEquipmentMap,
   maximumReservedQuantity,
   releaseEquipmentReservationLock,
+  startEquipmentReservationLockHeartbeat,
 } from "../lib/records.js"
 import { verifyOwner, verifyToken } from "../middleware/auth.js"
 
@@ -137,14 +138,14 @@ router.get("/analytics", async (req, res, next) => {
       collections.bookings.countDocuments({
         ...ownerBookingsFilter(req.user.id),
         $or: [
-          { bookingStatus: "completed" },
+          { bookingStatus: /^completed$/i },
           {
-            bookingStatus: null,
-            status: "completed",
-          },
-          {
-            bookingStatus: { $exists: false },
-            status: "completed",
+            $or: [
+              { bookingStatus: { $exists: false } },
+              { bookingStatus: null },
+              { bookingStatus: "" },
+            ],
+            status: /^completed$/i,
           },
         ],
       }),
@@ -176,10 +177,9 @@ router.get("/analytics", async (req, res, next) => {
           {
             $match: {
               ownerId: { $in: idCandidates(req.user.id) },
-              $or: [
-                { createdAt: { $gte: seriesStart } },
-                { startDate: { $gte: seriesStart } },
-              ],
+              $expr: {
+                $gte: [{ $ifNull: ["$createdAt", "$startDate"] }, seriesStart],
+              },
             },
           },
           {
@@ -207,7 +207,16 @@ router.get("/analytics", async (req, res, next) => {
           {
             $group: {
               _id: { $dateToString: { format: "%Y-%m", date: "$paidAt" } },
-              revenue: { $sum: "$amount" },
+              revenue: {
+                $sum: {
+                  $convert: {
+                    input: "$amount",
+                    to: "double",
+                    onError: 0,
+                    onNull: 0,
+                  },
+                },
+              },
             },
           },
         ])
@@ -308,7 +317,16 @@ router.get("/earnings", async (req, res, next) => {
         {
           $group: {
             _id: { $dateToString: { format: "%Y-%m", date: "$paidAt" } },
-            revenue: { $sum: "$amount" },
+            revenue: {
+              $sum: {
+                $convert: {
+                  input: "$amount",
+                  to: "double",
+                  onError: 0,
+                  onNull: 0,
+                },
+              },
+            },
           },
         },
       ])
@@ -375,7 +393,12 @@ router.get("/equipment", async (req, res, next) => {
         search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
         "i"
       )
-      filter.$or = [{ name: pattern }, { brand: pattern }, { model: pattern }]
+      filter.$or = [
+        { name: pattern },
+        { title: pattern },
+        { brand: pattern },
+        { model: pattern },
+      ]
     }
 
     const docs = await collections.equipment.find(filter).sort({ createdAt: -1 }).toArray()
@@ -625,6 +648,9 @@ router.patch("/equipment/:id", async (req, res, next) => {
         "Equipment is being booked. Please try the inventory update again."
       )
     }
+    const lockHeartbeat = lockToken
+      ? startEquipmentReservationLockHeartbeat(equipment._id, lockToken)
+      : null
 
     try {
       if (
@@ -638,6 +664,7 @@ router.patch("/equipment/:id", async (req, res, next) => {
         )
       }
 
+      await lockHeartbeat?.assertOwned()
       const updated = await collections.equipment.findOneAndUpdate(
         { _id: equipment._id },
         { $set: patch },
@@ -650,6 +677,7 @@ router.patch("/equipment/:id", async (req, res, next) => {
       return ok(res, normalizeEquipment(updated, users))
     } finally {
       if (lockToken) {
+        await lockHeartbeat.stop()
         await releaseEquipmentReservationLock(equipment._id, lockToken)
       }
     }
@@ -675,6 +703,10 @@ router.delete("/equipment/:id", async (req, res, next) => {
         "Equipment is being booked. Please try deleting it again."
       )
     }
+    const lockHeartbeat = startEquipmentReservationLockHeartbeat(
+      equipment._id,
+      lockToken
+    )
 
     try {
       const outstandingBooking = await collections.bookings.findOne(
@@ -692,6 +724,7 @@ router.delete("/equipment/:id", async (req, res, next) => {
         )
       }
 
+      await lockHeartbeat.assertOwned()
       const deleted = await collections.equipment.findOneAndDelete({
         _id: equipment._id,
       })
@@ -705,6 +738,7 @@ router.delete("/equipment/:id", async (req, res, next) => {
 
       return ok(res, { id: toId(deleted._id) })
     } finally {
+      await lockHeartbeat.stop()
       await releaseEquipmentReservationLock(equipment._id, lockToken)
     }
   } catch (error) {

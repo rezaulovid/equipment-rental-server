@@ -1,7 +1,7 @@
 import { Router } from "express"
 import { ObjectId } from "mongodb"
 
-import { collections } from "../lib/db.js"
+import { collections, withOptionalTransaction } from "../lib/db.js"
 import { parsePagination } from "../lib/pagination.js"
 import {
   bookingLifecycleFilter,
@@ -9,12 +9,14 @@ import {
   inventoryHoldFilter,
   maximumReservedQuantity,
   releaseEquipmentReservationLock,
+  startEquipmentReservationLockHeartbeat,
 } from "../lib/records.js"
 import {
   BOOKING_STATUSES,
   BOOKING_TRANSITIONS,
   EQUIPMENT_STATUSES,
   USER_ROLES,
+  isAccountSuspended,
   isSupportedRentalType,
   normalizeBooking,
   normalizeEquipment,
@@ -38,6 +40,21 @@ const ok = (res, data, status = 200) =>
   res.status(status).json({ success: true, data })
 
 const parseId = (value) => (ObjectId.isValid(value) ? new ObjectId(value) : null)
+const sessionOptions = (session) => (session ? { session } : {})
+
+async function activeAdministratorCount(session) {
+  const admins = await collections.users
+    .find(
+      { role: /^admin$/i },
+      {
+        projection: { banned: 1, banExpires: 1 },
+        ...sessionOptions(session),
+      }
+    )
+    .toArray()
+
+  return admins.filter((admin) => !isAccountSuspended(admin)).length
+}
 
 /** Loads the display names/emails referenced by a batch of documents. */
 async function loadUsers(ids) {
@@ -86,14 +103,25 @@ router.get("/analytics", async (_req, res, next) => {
       pendingApprovals,
       statusGroups,
       paidPayments,
-      paidBookings,
       monthlyBookingRows,
       monthlyRevenueRows,
     ] = await Promise.all([
       collections.users.countDocuments({}),
       collections.equipment.countDocuments({}),
       collections.bookings.countDocuments({}),
-      collections.bookings.countDocuments({ bookingStatus: "completed" }),
+      collections.bookings.countDocuments({
+        $or: [
+          { bookingStatus: /^completed$/i },
+          {
+            $or: [
+              { bookingStatus: { $exists: false } },
+              { bookingStatus: null },
+              { bookingStatus: "" },
+            ],
+            status: /^completed$/i,
+          },
+        ],
+      }),
       collections.equipment.countDocuments({
         $or: [{ status: "pending" }, { status: { $exists: false } }],
       }),
@@ -103,23 +131,30 @@ router.get("/analytics", async (_req, res, next) => {
       collections.payments
         .aggregate([
           { $match: { status: "paid" } },
-          { $group: { _id: null, total: { $sum: "$amount" } } },
-        ])
-        .toArray(),
-      collections.bookings
-        .aggregate([
-          { $match: { paymentStatus: "paid" } },
-          { $group: { _id: null, total: { $sum: "$totalAmount" } } },
+          {
+            $group: {
+              _id: null,
+              total: {
+                $sum: {
+                  $convert: {
+                    input: "$amount",
+                    to: "double",
+                    onError: 0,
+                    onNull: 0,
+                  },
+                },
+              },
+            },
+          },
         ])
         .toArray(),
       collections.bookings
         .aggregate([
           {
             $match: {
-              $or: [
-                { createdAt: { $gte: seriesStart } },
-                { startDate: { $gte: seriesStart } },
-              ],
+              $expr: {
+                $gte: [{ $ifNull: ["$createdAt", "$startDate"] }, seriesStart],
+              },
             },
           },
           {
@@ -131,7 +166,6 @@ router.get("/analytics", async (_req, res, next) => {
                 },
               },
               bookings: { $sum: 1 },
-              amount: { $sum: "$totalAmount" },
             },
           },
         ])
@@ -142,7 +176,16 @@ router.get("/analytics", async (_req, res, next) => {
           {
             $group: {
               _id: { $dateToString: { format: "%Y-%m", date: "$paidAt" } },
-              revenue: { $sum: "$amount" },
+              revenue: {
+                $sum: {
+                  $convert: {
+                    input: "$amount",
+                    to: "double",
+                    onError: 0,
+                    onNull: 0,
+                  },
+                },
+              },
             },
           },
         ])
@@ -181,10 +224,7 @@ router.get("/analytics", async (_req, res, next) => {
       }
     })
 
-    // Payments are the source of truth for money; fall back to bookings when
-    // the payments collection has not been populated yet.
     const revenueFromPayments = toNumber(paidPayments[0]?.total)
-    const revenueFromBookings = toNumber(paidBookings[0]?.total)
 
     return ok(res, {
       totalUsers,
@@ -192,8 +232,7 @@ router.get("/analytics", async (_req, res, next) => {
       totalBookings,
       pendingApprovals,
       completedRentals,
-      totalRevenue:
-        revenueFromPayments > 0 ? revenueFromPayments : revenueFromBookings,
+      totalRevenue: revenueFromPayments,
       equipmentByStatus: byStatus,
       monthly,
     })
@@ -219,6 +258,31 @@ router.get("/users", async (_req, res, next) => {
   }
 })
 
+router.get("/users/:id", async (req, res, next) => {
+  try {
+    const _id = parseId(req.params.id)
+    if (!_id) return fail(res, 400, "Invalid user id.")
+
+    const user = await collections.users.findOne(
+      { _id },
+      {
+        projection: {
+          password: 0,
+          passwordHash: 0,
+          credentials: 0,
+          sessions: 0,
+          accounts: 0,
+        },
+      }
+    )
+
+    if (!user) return fail(res, 404, "User not found.")
+    return ok(res, normalizeUser(user))
+  } catch (error) {
+    return next(error)
+  }
+})
+
 router.patch("/users/:id/role", async (req, res, next) => {
   try {
     const _id = parseId(req.params.id)
@@ -231,18 +295,43 @@ router.patch("/users/:id/role", async (req, res, next) => {
 
     // An admin can promote others but never rewrite their own role. That keeps
     // at least one admin in the system and blocks self-escalation paths.
-    if (req.user.id === req.params.id) {
+    if (req.user.id === _id.toString()) {
       return fail(res, 400, "You cannot change your own role.")
     }
 
-    const updated = await collections.users.findOneAndUpdate(
-      { _id },
-      { $set: { role, updatedAt: new Date() } },
-      { returnDocument: "after", projection: { password: 0 } }
-    )
+    const result = await withOptionalTransaction(async (session) => {
+      const current = await collections.users.findOne(
+        { _id },
+        sessionOptions(session)
+      )
+      if (!current) return { notFound: true }
 
-    if (!updated) return fail(res, 404, "User not found.")
-    return ok(res, normalizeUser(updated))
+      if (
+        role !== "admin" &&
+        String(current.role).toLowerCase() === "admin" &&
+        !isAccountSuspended(current) &&
+        (await activeAdministratorCount(session)) <= 1
+      ) {
+        return { lastAdministrator: true }
+      }
+
+      const updated = await collections.users.findOneAndUpdate(
+        { _id },
+        { $set: { role, updatedAt: new Date() } },
+        {
+          returnDocument: "after",
+          projection: { password: 0 },
+          ...sessionOptions(session),
+        }
+      )
+      return { updated }
+    })
+
+    if (result.notFound) return fail(res, 404, "User not found.")
+    if (result.lastAdministrator) {
+      return fail(res, 409, "The last active administrator cannot be demoted.")
+    }
+    return ok(res, normalizeUser(result.updated))
   } catch (error) {
     return next(error)
   }
@@ -265,21 +354,46 @@ router.patch("/users/:id/ban", async (req, res, next) => {
       return fail(res, 400, "Ban reason must be between 3 and 500 characters.")
     }
 
-    const updated = await collections.users.findOneAndUpdate(
-      { _id },
-      {
-        $set: {
-          banned: req.body.banned,
-          banReason: req.body.banned ? banReason : null,
-          banExpires: null,
-          updatedAt: new Date(),
-        },
-      },
-      { returnDocument: "after", projection: { password: 0 } }
-    )
+    const result = await withOptionalTransaction(async (session) => {
+      const current = await collections.users.findOne(
+        { _id },
+        sessionOptions(session)
+      )
+      if (!current) return { notFound: true }
 
-    if (!updated) return fail(res, 404, "User not found.")
-    return ok(res, normalizeUser(updated))
+      if (
+        req.body.banned &&
+        String(current.role).toLowerCase() === "admin" &&
+        !isAccountSuspended(current) &&
+        (await activeAdministratorCount(session)) <= 1
+      ) {
+        return { lastAdministrator: true }
+      }
+
+      const updated = await collections.users.findOneAndUpdate(
+        { _id },
+        {
+          $set: {
+            banned: req.body.banned,
+            banReason: req.body.banned ? banReason : null,
+            banExpires: null,
+            updatedAt: new Date(),
+          },
+        },
+        {
+          returnDocument: "after",
+          projection: { password: 0 },
+          ...sessionOptions(session),
+        }
+      )
+      return { updated }
+    })
+
+    if (result.notFound) return fail(res, 404, "User not found.")
+    if (result.lastAdministrator) {
+      return fail(res, 409, "The last active administrator cannot be suspended.")
+    }
+    return ok(res, normalizeUser(result.updated))
   } catch (error) {
     return next(error)
   }
@@ -364,6 +478,7 @@ router.get("/equipment", async (req, res, next) => {
       )
       filter.$or = [
         { name: pattern },
+        { title: pattern },
         { ownerName: pattern },
         { ownerEmail: pattern },
       ]
@@ -509,6 +624,9 @@ router.patch("/equipment/:id", async (req, res, next) => {
         "Equipment is being booked. Please try the inventory update again."
       )
     }
+    const lockHeartbeat = lockToken
+      ? startEquipmentReservationLockHeartbeat(_id, lockToken)
+      : null
 
     try {
       if (
@@ -522,6 +640,7 @@ router.patch("/equipment/:id", async (req, res, next) => {
         )
       }
 
+      await lockHeartbeat?.assertOwned()
       const updated = await collections.equipment.findOneAndUpdate(
         { _id },
         { $set: patch },
@@ -534,6 +653,7 @@ router.patch("/equipment/:id", async (req, res, next) => {
       return ok(res, normalizeEquipment(updated, owners))
     } finally {
       if (lockToken) {
+        await lockHeartbeat.stop()
         await releaseEquipmentReservationLock(_id, lockToken)
       }
     }
@@ -558,6 +678,7 @@ router.delete("/equipment/:id", async (req, res, next) => {
         "Equipment is being booked. Please try deleting it again."
       )
     }
+    const lockHeartbeat = startEquipmentReservationLockHeartbeat(_id, lockToken)
 
     try {
       const outstandingBooking = await collections.bookings.findOne(
@@ -575,6 +696,7 @@ router.delete("/equipment/:id", async (req, res, next) => {
         )
       }
 
+      await lockHeartbeat.assertOwned()
       const deleted = await collections.equipment.findOneAndDelete({ _id })
       if (!deleted) return fail(res, 404, "Equipment not found.")
 
@@ -586,6 +708,7 @@ router.delete("/equipment/:id", async (req, res, next) => {
 
       return ok(res, { id: req.params.id })
     } finally {
+      await lockHeartbeat.stop()
       await releaseEquipmentReservationLock(_id, lockToken)
     }
   } catch (error) {

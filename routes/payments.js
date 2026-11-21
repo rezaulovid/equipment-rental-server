@@ -1,6 +1,6 @@
 import { Router } from "express"
 
-import { collections } from "../lib/db.js"
+import { collections, withOptionalTransaction } from "../lib/db.js"
 import {
   markCheckoutFailed,
   markCheckoutPaid,
@@ -18,6 +18,8 @@ const ok = (res, data, status = 200) =>
 
 const fail = (res, status, message) =>
   res.status(status).json({ success: false, message })
+
+const sessionOptions = (session) => (session ? { session } : {})
 
 /**
  * Verifies a Checkout session with Stripe after the success redirect. This is
@@ -100,54 +102,76 @@ export async function handleStripeWebhook(req, res) {
   }
 
   try {
-    // Idempotency: Stripe retries deliveries, and the unique index makes sure
-    // the same event id is only processed once.
-    const alreadyProcessed = await collections.webhookEvents.findOne({
-      eventId: event.id,
+    const result = await withOptionalTransaction(async (databaseSession) => {
+      const alreadyProcessed = await collections.webhookEvents.findOne(
+        { eventId: event.id },
+        sessionOptions(databaseSession)
+      )
+      if (alreadyProcessed) return { duplicate: true }
+
+      let outcome
+      switch (event.type) {
+        case "checkout.session.completed":
+          if (event.data.object.payment_status === "paid") {
+            outcome = await markCheckoutPaid(event.data.object, databaseSession)
+          }
+          break
+
+        case "checkout.session.async_payment_succeeded":
+          outcome = await markCheckoutPaid(event.data.object, databaseSession)
+          break
+
+        case "checkout.session.async_payment_failed":
+          outcome = await markCheckoutFailed(
+            event.data.object,
+            "async_payment_failed",
+            { cancelBooking: false },
+            databaseSession
+          )
+          break
+
+        case "checkout.session.expired":
+          outcome = await markCheckoutFailed(
+            event.data.object,
+            "expired",
+            { cancelBooking: false },
+            databaseSession
+          )
+          break
+
+        case "payment_intent.payment_failed":
+          outcome = await markPaymentIntentFailed(
+            event.data.object,
+            databaseSession
+          )
+          break
+
+        default:
+          break
+      }
+
+      if (
+        outcome?.reason &&
+        !["already_paid", "missing_metadata"].includes(outcome.reason)
+      ) {
+        throw new Error(
+          `Unable to apply Stripe event ${event.id}: ${outcome.reason}`
+        )
+      }
+
+      await collections.webhookEvents.insertOne(
+        {
+          eventId: event.id,
+          type: event.type,
+          receivedAt: new Date(),
+        },
+        sessionOptions(databaseSession)
+      )
+
+      return { duplicate: false }
     })
 
-    if (alreadyProcessed) {
-      return res.json({ received: true, duplicate: true })
-    }
-
-    switch (event.type) {
-      case "checkout.session.completed":
-        if (event.data.object.payment_status === "paid") {
-          await markCheckoutPaid(event.data.object)
-        }
-        break
-
-      case "checkout.session.async_payment_succeeded":
-        await markCheckoutPaid(event.data.object)
-        break
-
-      case "checkout.session.async_payment_failed":
-        await markCheckoutFailed(event.data.object, "async_payment_failed", {
-          cancelBooking: false,
-        })
-        break
-
-      case "checkout.session.expired":
-        await markCheckoutFailed(event.data.object, "expired", {
-          cancelBooking: false,
-        })
-        break
-
-      case "payment_intent.payment_failed":
-        await markPaymentIntentFailed(event.data.object)
-        break
-
-      default:
-        break
-    }
-
-    await collections.webhookEvents.insertOne({
-      eventId: event.id,
-      type: event.type,
-      receivedAt: new Date(),
-    })
-
-    return res.json({ received: true })
+    return res.json({ received: true, ...result })
   } catch (error) {
     if (error?.code === 11000) {
       return res.json({ received: true, duplicate: true })

@@ -18,7 +18,7 @@ const app = express()
 const port = Number(process.env.PORT ?? 5000)
 
 const allowedOrigins = [
-  "http://localhost:3000",
+  "https://equipment-rental-cleint.vercel.app",
   ...(process.env.CLIENT_URL ?? "")
     .split(",")
     .map((origin) => origin.trim())
@@ -104,3 +104,5 @@ app.use((error, _req, res, next) => {
 app.listen(port, () => {
   console.log(`equipment-rental-server listening on port ${port}`)
 })
+
+export default app;

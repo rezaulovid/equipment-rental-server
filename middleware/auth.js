@@ -2,6 +2,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose"
 import { ObjectId } from "mongodb"
 
 import { collections } from "../lib/db.js"
+import { isAccountSuspended } from "../lib/normalize.js"
 
 const issuer = process.env.BETTER_AUTH_URL
 
@@ -67,10 +68,7 @@ export async function verifyToken(req, res, next) {
     return respond(res, 401, "Account not found.")
   }
 
-  if (
-    user.banned &&
-    (!user.banExpires || new Date(user.banExpires).getTime() > Date.now())
-  ) {
+  if (isAccountSuspended(user)) {
     return respond(res, 403, "This account is suspended.")
   }
 

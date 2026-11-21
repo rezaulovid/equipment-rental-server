@@ -3,7 +3,15 @@ import { ObjectId } from "mongodb"
 
 import { collections } from "../lib/db.js"
 import { createBookingCheckout } from "../lib/checkout.js"
-import { toId, toNumber } from "../lib/normalize.js"
+import {
+  bookingRequestFingerprint,
+  parseIdempotencyKey,
+} from "../lib/idempotency.js"
+import {
+  calculateAvailableQuantity,
+  toId,
+  toNumber,
+} from "../lib/normalize.js"
 import {
   acquireEquipmentReservationLock,
   customerOwnershipFilter,
@@ -11,6 +19,7 @@ import {
   idCandidates,
   inventoryHoldFilter,
   releaseEquipmentReservationLock,
+  startEquipmentReservationLockHeartbeat,
 } from "../lib/records.js"
 import { expireCheckoutForCustomer } from "../lib/payments.js"
 import {
@@ -74,11 +83,14 @@ function validateBookingInput(body) {
   }
 }
 
-/**
- * Sums the quantity of rentals that overlap the requested period and still
- * hold inventory. Cancelled and completed rentals release their stock.
- */
-async function reservedQuantity(equipmentId, startDate, endDate, ignoreId) {
+/** Finds the peak concurrent reservation during the requested interval. */
+async function equipmentAvailability(
+  equipmentId,
+  totalQuantity,
+  startDate,
+  endDate,
+  ignoreId
+) {
   const filter = {
     ...inventoryHoldFilter(equipmentId),
     startDate: { $lt: endDate },
@@ -90,9 +102,11 @@ async function reservedQuantity(equipmentId, startDate, endDate, ignoreId) {
   }
 
   const overlapping = await collections.bookings.find(filter).toArray()
-  return overlapping.reduce(
-    (sum, booking) => sum + toNumber(booking.quantity, 1),
-    0
+  return calculateAvailableQuantity(
+    totalQuantity,
+    overlapping,
+    startDate,
+    endDate
   )
 }
 
@@ -118,15 +132,65 @@ async function createPendingPayment(bookingId, customerId, amount, ownerId) {
   return result.insertedId
 }
 
+async function replayIdempotentBooking(res, booking, fingerprint) {
+  if (booking.idempotencyFingerprint !== fingerprint) {
+    return fail(
+      res,
+      409,
+      "This idempotency key was already used for a different booking request."
+    )
+  }
+
+  const payment = await collections.payments.findOne(
+    {
+      bookingId: { $in: [toId(booking._id), ...idCandidates(booking._id)] },
+    },
+    { sort: { createdAt: -1 } }
+  )
+
+  if (!payment?.checkoutUrl) {
+    return fail(res, 409, "This booking request is still being processed.")
+  }
+
+  return ok(
+    res,
+    {
+      bookingId: toId(booking._id),
+      paymentId: toId(payment._id),
+      checkoutUrl: payment.checkoutUrl,
+      amount: toNumber(payment.amount ?? booking.totalAmount),
+      currency: String(payment.currency ?? booking.currency ?? stripeCurrency).toUpperCase(),
+    },
+    200
+  )
+}
+
 /**
  * Creates a pending booking and its Stripe Checkout session. The client only
  * sends rental details — every amount is calculated here from the equipment
  * document, and Stripe is the only party that can later confirm payment.
  */
 router.post("/", async (req, res, next) => {
+  let idempotencyKey = null
+  let fingerprint = null
   try {
+    const parsedKey = parseIdempotencyKey(req.get("Idempotency-Key"))
+    if (parsedKey.error) return fail(res, 400, parsedKey.error)
+    idempotencyKey = parsedKey.key
+
     const input = validateBookingInput(req.body ?? {})
     if (input.error) return fail(res, 400, input.error)
+    if (idempotencyKey) fingerprint = bookingRequestFingerprint(input)
+
+    if (idempotencyKey) {
+      const existing = await collections.bookings.findOne({
+        customerId: req.user.id,
+        idempotencyKey,
+      })
+      if (existing) {
+        return replayIdempotentBooking(res, existing, fingerprint)
+      }
+    }
 
     let equipment = await collections.equipment.findOne(
       equipmentByIdFilter(input.equipmentId)
@@ -145,6 +209,10 @@ router.post("/", async (req, res, next) => {
         "Another booking is being created for this equipment. Please try again."
       )
     }
+    const lockHeartbeat = startEquipmentReservationLockHeartbeat(
+      reservationEquipmentId,
+      lockToken
+    )
 
     let pricing
     let bookingDoc
@@ -170,12 +238,12 @@ router.post("/", async (req, res, next) => {
         )
       }
 
-      const reserved = await reservedQuantity(
+      const { availableQuantity: available } = await equipmentAvailability(
         equipment._id,
+        totalQuantity,
         input.startDate,
         input.endDate
       )
-      const available = Math.max(totalQuantity - reserved, 0)
 
       if (input.quantity > available) {
         return fail(
@@ -186,6 +254,8 @@ router.post("/", async (req, res, next) => {
             : `Only ${available} unit${available === 1 ? "" : "s"} available for the selected dates.`
         )
       }
+
+      await lockHeartbeat.assertOwned()
 
       pricing = calculateRentalTotal({
         rentalPrice: equipment.rentalPrice ?? equipment.price,
@@ -206,6 +276,8 @@ router.post("/", async (req, res, next) => {
         equipmentImage: equipment.image ?? "",
         equipmentCategory: equipment.category ?? "",
         customerId: req.user.id,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...(fingerprint ? { idempotencyFingerprint: fingerprint } : {}),
         customerName: req.user.name,
         customerEmail: req.user.email,
         ownerId: toId(equipment.ownerId),
@@ -233,6 +305,7 @@ router.post("/", async (req, res, next) => {
       }
 
       inserted = await collections.bookings.insertOne(bookingDoc)
+      await lockHeartbeat.assertOwned()
       paymentId = await createPendingPayment(
         inserted.insertedId,
         req.user.id,
@@ -255,6 +328,7 @@ router.post("/", async (req, res, next) => {
 
       throw error
     } finally {
+      await lockHeartbeat.stop()
       await releaseEquipmentReservationLock(reservationEquipmentId, lockToken)
     }
 
@@ -330,6 +404,13 @@ router.post("/", async (req, res, next) => {
       throw error
     }
   } catch (error) {
+    if (error?.code === 11000 && idempotencyKey) {
+      const existing = await collections.bookings.findOne({
+        customerId: req.user.id,
+        idempotencyKey,
+      })
+      if (existing) return replayIdempotentBooking(res, existing, fingerprint)
+    }
     return next(error)
   }
 })
@@ -393,13 +474,13 @@ router.post("/:id/checkout", async (req, res, next) => {
       }
     }
 
-    const reserved = await reservedQuantity(
+    const { availableQuantity: available } = await equipmentAvailability(
       equipment._id,
+      equipmentQuantity(equipment),
       booking.startDate,
       booking.endDate,
       booking._id
     )
-    const available = Math.max(equipmentQuantity(equipment) - reserved, 0)
 
     if (toNumber(booking.quantity, 1) > available) {
       return fail(

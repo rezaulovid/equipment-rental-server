@@ -1,7 +1,12 @@
 import { Router } from "express"
 
 import { collections } from "../lib/db.js"
-import { normalizeEquipment, toId, toNumber } from "../lib/normalize.js"
+import {
+  calculateAvailableQuantity,
+  normalizeEquipment,
+  toId,
+  toNumber,
+} from "../lib/normalize.js"
 import { parsePagination } from "../lib/pagination.js"
 import {
   byIdFilter,
@@ -134,6 +139,7 @@ router.get("/", async (req, res, next) => {
       additionalClauses.push({
         $or: [
           { name: pattern },
+          { title: pattern },
           { description: pattern },
           { category: pattern },
           { brand: pattern },
@@ -211,46 +217,33 @@ router.get("/", async (req, res, next) => {
       .toArray()
 
     if (availability) {
-      const equipmentIds = docs.flatMap((doc) => idCandidates(doc._id))
-      const overlapping = equipmentIds.length
+      const overlapping = docs.length
         ? await collections.bookings
             .find({
-              equipmentId: { $in: equipmentIds },
-              bookingStatus: { $in: ["pending", "active"] },
+              ...inventoryHoldFilter(docs.map((doc) => doc._id)),
               startDate: { $lt: availabilityEnd },
               endDate: { $gt: availabilityStart },
-              $or: [
-                { paymentStatus: "paid" },
-                {
-                  paymentStatus: { $in: ["pending", "unpaid"] },
-                  $or: [
-                    { checkoutExpiresAt: { $gte: new Date() } },
-                    {
-                      checkoutExpiresAt: { $exists: false },
-                      createdAt: {
-                        $gte: new Date(Date.now() - 35 * 60 * 1000),
-                      },
-                    },
-                  ],
-                },
-              ],
             })
             .toArray()
         : []
 
-      const reservedByEquipment = new Map()
+      const bookingsByEquipment = new Map()
       for (const booking of overlapping) {
         const id = toId(booking.equipmentId)
-        reservedByEquipment.set(
-          id,
-          (reservedByEquipment.get(id) ?? 0) + toNumber(booking.quantity, 1)
-        )
+        const bookings = bookingsByEquipment.get(id) ?? []
+        bookings.push(booking)
+        bookingsByEquipment.set(id, bookings)
       }
 
       docs = docs.filter((doc) => {
         const quantity = toNumber(doc.availableQuantity ?? doc.quantity, 0)
-        const reserved = reservedByEquipment.get(toId(doc._id)) ?? 0
-        const isAvailable = quantity - reserved >= requestedQuantity
+        const inventory = calculateAvailableQuantity(
+          quantity,
+          bookingsByEquipment.get(toId(doc._id)) ?? [],
+          availabilityStart,
+          availabilityEnd
+        )
+        const isAvailable = inventory.availableQuantity >= requestedQuantity
         return availability === "available" ? isAvailable : !isAvailable
       })
     }
@@ -267,17 +260,22 @@ router.get("/", async (req, res, next) => {
             .filter(Boolean)
             .flatMap(idCandidates),
         },
-      }, { projection: { name: 1, email: 1 } })
+      }, { projection: { name: 1 } })
       .toArray()
 
     const ownerMap = Object.fromEntries(
       owners.map((owner) => [
         toId(owner._id),
-        { name: owner.name ?? "", email: owner.email ?? "" },
+        { name: owner.name ?? "" },
       ])
     )
 
-    return ok(res, docs.map((doc) => normalizeEquipment(doc, ownerMap)))
+    return ok(
+      res,
+      docs.map((doc) =>
+        normalizeEquipment(doc, ownerMap, { includeOwnerEmail: false })
+      )
+    )
   } catch (error) {
     return next(error)
   }
@@ -326,9 +324,11 @@ router.get("/:id/availability", async (req, res, next) => {
       })
       .toArray()
 
-    const bookedQuantity = overlap.reduce(
-      (sum, booking) => sum + toNumber(booking.quantity, 1),
-      0
+    const inventory = calculateAvailableQuantity(
+      toNumber(equipment.availableQuantity ?? equipment.quantity, 0),
+      overlap,
+      dates.startDate,
+      dates.endDate
     )
     const totalQuantity = toNumber(
       equipment.availableQuantity ?? equipment.quantity,
@@ -338,8 +338,8 @@ router.get("/:id/availability", async (req, res, next) => {
     return ok(res, {
       equipmentId: toId(equipment._id),
       totalQuantity,
-      bookedQuantity,
-      availableQuantity: Math.max(totalQuantity - bookedQuantity, 0),
+      bookedQuantity: inventory.reservedQuantity,
+      availableQuantity: inventory.availableQuantity,
       startDate: dates.startDate.toISOString(),
       endDate: dates.endDate.toISOString(),
     })
@@ -363,6 +363,7 @@ router.get("/:id", async (req, res, next) => {
         $or: [
           { slug: id },
           { name: new RegExp(`^${escapeRegExp(slug)}$`, "i") },
+          { title: new RegExp(`^${escapeRegExp(slug)}$`, "i") },
         ],
       })
     }
@@ -373,7 +374,7 @@ router.get("/:id", async (req, res, next) => {
 
     const owner = equipment.ownerId
       ? await collections.users.findOne(byIdFilter(equipment.ownerId), {
-          projection: { name: 1, email: 1 },
+          projection: { name: 1 },
         })
       : null
 
@@ -381,12 +382,14 @@ router.get("/:id", async (req, res, next) => {
       ? {
           [toId(owner._id)]: {
             name: owner.name ?? "",
-            email: owner.email ?? "",
           },
         }
       : {}
 
-    return ok(res, normalizeEquipment(equipment, ownerMap))
+    return ok(
+      res,
+      normalizeEquipment(equipment, ownerMap, { includeOwnerEmail: false })
+    )
   } catch (error) {
     return next(error)
   }

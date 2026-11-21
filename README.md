@@ -52,9 +52,13 @@ startup.
 - `/api/customer` — customer profile, rentals, and payments
 - `/api/owner` — owner equipment, rentals, and analytics
 - `/api/admin` — admin management and platform analytics
+- `/api/admin/users/:id` — retrieve normalized details for one user (admin only)
 
 Customer, owner, and admin rental lists accept optional `page` and `limit`
 query parameters while retaining their existing array response shape.
+Booking creation accepts an optional `Idempotency-Key` header. Reusing the key
+with different rental details returns `409` rather than replaying another
+booking.
 
 Authentication tokens are verified against the BetterAuth JWKS endpoint at
 `{BETTER_AUTH_URL}/api/auth/jwks`. API roles are loaded from MongoDB for each
